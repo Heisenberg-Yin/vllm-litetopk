@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused DSA (DeepSeek Sparse Attention) indexer top-k for Blackwell (SM100).
 
-Streams KV in tiles and fuses fp8 MQA scoring (tcgen05 UMMA) + an online
-bucketed gate + compact top-k, so the ``[num_q, seq_len]`` logit matrix is
-never materialized.
+Pair-swaps the carried HOT12288 set into the ordinary paged-gather prefix,
+scores/emits that prefix once, then streams only the suffix through a fixed
+bucket gate.  The score scan does not maintain a histogram; a compact
+candidate-only postpass rebuilds the selector certificate, so the
+``[num_q, seq_len]`` logit matrix is never materialized.
 
 The kernels are JIT-compiled from ``csrc/libtorch_stable/attention/dsa/latest``
 by ``litetopk_indexer``; this module is the vLLM-facing layer over it, adapting
@@ -21,19 +23,10 @@ import torch
 
 from vllm.model_executor.layers import litetopk_indexer as latest_litetopk
 
-# Streaming-aware indexing leaves only 1008 ranked slots after LongCat's
-# 16 sink + 1024 local tokens. With a hot-carry sample, zero forward
-# headroom can collapse enough newly-hot scores into bucket 0 for the packed
-# selector's boundary certificate to be undefined (the CUDA kernel traps
-# intentionally in that case). Half a sample span is the kernel's designed
-# drift allowance and keeps that boundary representable. Non-streaming
-# callers (GLM) retain the adapter's configured/default headroom.
-_STREAMING_MIN_HEADROOM = 0.5
-
 
 @functools.cache
 def dsa_litetopk_latest_available() -> bool:
-    """Whether the vendored high24-v1 adapter can run on this device."""
+    """Whether the exact-once high24 adapter can run on this device."""
     if not latest_litetopk.ENABLED or not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability()[0] == 10
@@ -63,6 +56,47 @@ def dsa_litetopk_latest_dense_topk(
     )
 
 
+def dsa_litetopk_latest_prepare_permuted_gather(
+    kv_cache: torch.Tensor,
+    dst_k: torch.Tensor,
+    dst_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    sequence_length: int,
+    query_length: int,
+    num_reqs: int,
+    common_end: int,
+    window_start: int,
+    hot_key: str | None,
+):
+    """Consume the carry-prepared HOT12288 map and gather the cache once.
+
+    The asynchronous carry is consumed by one main-extension binding that
+    plans the pair swap and writes the permuted paged cache workspace.
+    """
+    if not dsa_litetopk_latest_available():
+        return None
+    return latest_litetopk.prepare_permuted_gather(
+        kv_cache,
+        dst_k,
+        dst_scale,
+        block_table,
+        sequence_length=sequence_length,
+        query_length=query_length,
+        num_reqs=num_reqs,
+        common_end=common_end,
+        window_start=window_start,
+        hot_key=hot_key,
+    )
+
+
+def dsa_litetopk_latest_release_pair_swap_workspace(
+    device: torch.device,
+) -> None:
+    """Release the current stream's pair-swap planner state."""
+    latest_litetopk.release_pair_swap_workspace(device)
+
+
 def dsa_litetopk_latest_streaming_indexer(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -78,6 +112,8 @@ def dsa_litetopk_latest_streaming_indexer(
     num_reqs: int,
     ke_min_hint: int,
     hot_key: str | None,
+    permuted_plan=None,
+    q_sf: torch.Tensor | None = None,
 ) -> bool:
     """Run the vendored production kernel while preserving streaming tokens."""
     if not dsa_litetopk_latest_available():
@@ -109,7 +145,15 @@ def dsa_litetopk_latest_streaming_indexer(
             device=out_indices.device,
         )
     )
-    ok = latest_litetopk.try_chunk(
+    common_ke = ke_min_hint - num_local_tokens
+    # The signed-sortable high24 candidate ABI preserves exact order inside
+    # bucket zero, so streaming callers no longer need a forced drift margin.
+    # Keeping the configured value (zero in production) also avoids widening
+    # every fixed-threshold bucket and inflating the candidate slab.
+    headroom = latest_litetopk.HEADROOM if n_forced else None
+    if permuted_plan is None:
+        return False
+    ok = latest_litetopk.try_large_exact_once_chunk(
         q,
         kv,
         kv_scales,
@@ -118,15 +162,15 @@ def dsa_litetopk_latest_streaming_indexer(
         ke_in,
         inner,
         k_free,
+        permuted_plan=permuted_plan,
         num_reqs=num_reqs,
-        ke_min_hint=ke_min_hint - num_local_tokens,
+        ke_min_hint=common_ke,
         cap=latest_litetopk.MERGE_CAP,
         hot_key=hot_key,
         ks_common_hint=num_init_tokens,
         carry_extent_hint=kv.shape[0] - num_local_tokens,
-        headroom=(
-            max(latest_litetopk.HEADROOM, _STREAMING_MIN_HEADROOM) if n_forced else None
-        ),
+        headroom=headroom,
+        q_sf=q_sf,
     )
     if not ok:
         return False
@@ -162,19 +206,30 @@ def dsa_litetopk_latest_stash_dense(
     num_init_tokens: int,
     num_local_tokens: int,
     hot_key: str | None,
+    use_fp4: bool = False,
 ) -> None:
     """Seed the hot-only adapter from the final dense chunk before crossover."""
+    # The next scheduler step can have a different query length. Refresh from
+    # every dense step that could precede a full-Q exact-once chunk, rather
+    # than predicting the next length from this step's row count.
+    min_s = latest_litetopk.production_min_s(use_fp4)
+    seeds_production_boundary = min_s - 32768 <= seq_len < min_s
     if (
         not dsa_litetopk_latest_available()
         or hot_key is None
         or not latest_litetopk.HOTONLY
-        or not (latest_litetopk.MIN_S - 32768 <= seq_len < latest_litetopk.MIN_S)
+        or not seeds_production_boundary
     ):
         return
 
     n_forced = num_init_tokens + num_local_tokens
     if n_forced == 0:
-        latest_litetopk.stash_carry(hot_key, topk_indices, seq_len)
+        latest_litetopk.stash_carry(
+            hot_key,
+            topk_indices,
+            seq_len,
+            next_sequence_length=seq_len + latest_litetopk.FUSED_QUERY_LEN,
+        )
         return
 
     k_free = topk_indices.shape[1] - n_forced
@@ -192,4 +247,5 @@ def dsa_litetopk_latest_stash_dense(
         interior,
         seq_len - num_local_tokens,
         min_index=num_init_tokens,
+        next_sequence_length=seq_len + latest_litetopk.FUSED_QUERY_LEN,
     )

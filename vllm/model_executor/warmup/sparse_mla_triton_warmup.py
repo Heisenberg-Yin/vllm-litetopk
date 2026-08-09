@@ -184,6 +184,7 @@ def _warm_prefill_chunk_metadata_kernel(
                 query_start_loc,
                 query_start_loc_cpu,
                 warmup_uncompressed_seq_lens,
+                warmup_uncompressed_seq_lens.cpu(),
                 compressed_seq_lens,
                 compressed_seq_lens_cpu,
                 block_table,

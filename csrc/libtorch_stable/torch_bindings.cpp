@@ -489,9 +489,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor workspace, int k, int max_seq_len) -> ()");
 
 #ifdef ENABLE_LITEDSA
-  // Grouped sparse prefill attention (SM100): group-union + query-major
-  // membership builder (overwrite-write) and the fp8 masked head128
-  // attention forward with exact per-query attend-sets.
   ops.def(
       "litedsa_union_qm(Tensor topk_indices, Tensor! u_phys, "
       "Tensor! counts, Tensor! memb_qm, Tensor req_pg, Tensor block_table, "

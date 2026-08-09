@@ -1,7 +1,12 @@
+// ---- DSv4 mixed-precision UMMA atoms ----
+// SM100_MMA_F16BF16_2x1SM_SS without elect_one_sync(), mirroring the fp8
+// NOELECT atom in litedsa_attention_sm100.cuh: the caller (single MMA warp,
+// one issuing thread) already guarantees one issuer. Used for the 64-dim
+// bf16 RoPE segment of DeepSeek-V4's QK dot, accumulating into the same
+// tmem accumulator as the fp8 NoPE segments (kind::f16 after kind::f8f6f4;
+// both accumulate fp32).
 #pragma once
-// SM100_MMA_F8F6F4_2x1SM_SS without elect_one_sync(), mirroring the
-// F16BF16 NOELECT atoms in kerutils/device/sm100/gemm.cuh. The caller
-// (single MMA warp, one issuing thread) already guarantees one issuer.
+
 #include <cute/tensor.hpp>
 
 namespace cute {
@@ -10,12 +15,12 @@ template <class a_type, class b_type, class c_type, int M, int N,
           UMMA::Major a_major, UMMA::Major b_major,
           UMMA::ScaleIn a_neg = UMMA::ScaleIn::One,
           UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
-struct SM100_MMA_F8F6F4_2x1SM_SS_NOELECT {
+struct SM100_MMA_F16BF16_2x1SM_SS_NOELECT {
   static_assert(M == 128 || M == 256,
-                "SM100_MMA_F8F6F4_2x1SM_SS_NOELECT M-mode size should be 128 "
+                "SM100_MMA_F16BF16_2x1SM_SS_NOELECT M-mode size should be 128 "
                 "or 256 for 2 CTA cluster MMA.");
   static_assert((N % 16 == 0) && (16 <= N) && (N <= 256),
-                "SM100_MMA_F8F6F4_2x1SM_SS_NOELECT N-mode size should be a "
+                "SM100_MMA_F16BF16_2x1SM_SS_NOELECT N-mode size should be a "
                 "multiple of 16 between 16 and 256.");
 
   using DRegisters = void;
@@ -28,14 +33,14 @@ struct SM100_MMA_F8F6F4_2x1SM_SS_NOELECT {
                                    uint32_t const& tmem_c,
                                    uint32_t const& scaleC,
                                    uint64_t const& idescE) {
-#if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
+#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
     uint32_t mask[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::f8f6f4 [%0], %1, %2, %3, {%5, %6, %7, "
-        "%8, %9, %10, %11, %12}, p; \n\t"
+        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, %8, "
+        "%9, %10, %11, %12}, p; \n\t"
         "}\n"
         :
         : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE >> 32)),
@@ -43,8 +48,8 @@ struct SM100_MMA_F8F6F4_2x1SM_SS_NOELECT {
           "r"(mask[4]), "r"(mask[5]), "r"(mask[6]), "r"(mask[7]));
 #else
     CUTE_INVALID_CONTROL_PATH(
-        "Attempting to use SM100_MMA_F8F6F4_2x1SM_SS_NOELECT without "
-        "CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED");
+        "Attempting to use SM100_MMA_F16BF16_2x1SM_SS_NOELECT without "
+        "CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED");
 #endif
   }
 };
@@ -52,21 +57,21 @@ struct SM100_MMA_F8F6F4_2x1SM_SS_NOELECT {
 template <class a_type, class b_type, class c_type, int M, int N,
           UMMA::Major a_major, UMMA::Major b_major, UMMA::ScaleIn a_neg,
           UMMA::ScaleIn b_neg>
-struct MMA_Traits<SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<
+struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_NOELECT<
     a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg>> {
   using ValTypeD = c_type;
   using ValTypeA = a_type;
   using ValTypeB = b_type;
   using ValTypeC = c_type;
-  static_assert(cute::sizeof_bits_v<a_type> <= 8 &&
-                    cute::sizeof_bits_v<b_type> <= 8,
-                "SM100_MMA_F8F6F4_2x1SM_SS_NOELECT supports <= 8bit types");
+  static_assert(cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> &&
+                    cute::sizeof_bits_v<b_type> == 16,
+                "SM100_MMA_F16BF16_2x1SM_SS_NOELECT supports 16bit types");
 
   using FrgTypeA = UMMA::smem_desc<a_major>;
   using FrgTypeB = UMMA::smem_desc<b_major>;
   using FrgTypeC = UMMA::tmem_frg_2sm<c_type>;
 
-  // Size of instruction's K extent is always 256bits -> 32 elements for 8bit
+  // Size of instruction's K extent is always 256bits -> 16 elements for 16bit
   constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
 
   using Shape_MNK = Shape<Int<M>, Int<N>, Int<K>>;
@@ -82,8 +87,16 @@ struct MMA_Traits<SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<
       UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major,
                             a_neg, b_neg>();
 
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
   UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
 
+  CUTE_HOST_DEVICE constexpr void set(UMMA::ScaleOut accumulate) {
+    accumulate_ = accumulate;
+  }
+
+  // Descriptor-based unpack, mirroring the fp8 NOELECT traits in
+  // litedsa_attention_sm100.cuh (the generic cute mma_unpack cannot digest
+  // UMMA descriptor iterators for this op).
   template <class TD, class DLayout, class TA, class ALayout, class TB,
             class BLayout, class TC, class CLayout>
   CUTE_HOST_DEVICE constexpr friend void mma_unpack(
@@ -102,11 +115,11 @@ struct MMA_Traits<SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<
     uint32_t tmem_c = raw_pointer_cast(D.data());
     uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
 
-    SM100_MMA_F8F6F4_2x1SM_SS_NOELECT<a_type, b_type, c_type, M, N, a_major,
-                                      b_major, a_neg,
-                                      b_neg>::fma(desc_a, desc_b, tmem_c,
-                                                  uint32_t(traits.accumulate_),
-                                                  idesc);
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<a_type, b_type, c_type, M, N, a_major,
+                                       b_major, a_neg,
+                                       b_neg>::fma(desc_a, desc_b, tmem_c,
+                                                   uint32_t(traits.accumulate_),
+                                                   idesc);
   }
 };
 

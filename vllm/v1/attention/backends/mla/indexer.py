@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
+import os as _os
 from dataclasses import dataclass
 
 import torch
@@ -69,34 +69,25 @@ def _prepare_uniform_decode_kernel(
     tl.store(decode_lens_ptr + idx, 1)
 
 
-# Gathered-context length below which the dense indexer path beats the fused
-# one after recurring carry publication is included. At 160K the margin is
-# only 0.266 ms/call, while 192K saves 1.091 ms/call and 256K saves 2.472 ms,
-# so keep the production floor at the first robust point.
-_FUSED_MIN_SEQ_LEN = 196608
+# Fixed HOT12288 single-scan production envelope. The format-specific
+# crossovers must agree with litetopk_indexer and sparse_attn_indexer. An
+# explicit legacy min-S remains a universal override.
+_FUSED_MIN_SEQ_LEN_OVERRIDE = _os.environ.get("VLLM_LITETOPK_PRODUCTION_MIN_S")
+_FUSED_MIN_SEQ_LEN = int(_FUSED_MIN_SEQ_LEN_OVERRIDE or "196608")
+_FP4_FUSED_MIN_SEQ_LEN = int(
+    _os.environ.get(
+        "VLLM_LITETOPK_FP4_PRODUCTION_MIN_S",
+        _FUSED_MIN_SEQ_LEN_OVERRIDE or "65536",
+    )
+)
+_FUSED_MAX_SEQ_LEN = 1 << 20
 _FUSED_QUERY_LEN = 8192
 _FUSED_TAIL_QUERY_LEN = 8128
-_FUSED_MIN_HOT_SAMPLE = 8192
-_FUSED_MIN_CANDIDATE_CAP = 24576
 
 
-def _configured_litetopk_fused_min_seq_len() -> int:
-    """Return the safe planner crossover for the configured hot-only path.
-
-    The planner must not exempt a chunk from the dense-logits memory budget
-    unless the runtime adapter is configured to accept it. Keep the measured
-    192K crossover when users lower ``MIN_S``; honor larger runtime gates.
-    """
-    if os.environ.get("VLLM_LITETOPK_HOTONLY", "1") != "1":
-        return 0
-    hot_sample = int(os.environ.get("VLLM_LITETOPK_HOTSAMPLE", "8192"))
-    if hot_sample < _FUSED_MIN_HOT_SAMPLE:
-        return 0
-    merge_cap = int(os.environ.get("VLLM_LITETOPK_MERGE_CAP", "32768"))
-    if merge_cap < _FUSED_MIN_CANDIDATE_CAP:
-        return 0
-    runtime_min_s = int(os.environ.get("VLLM_LITETOPK_MIN_S", "196608"))
-    return max(_FUSED_MIN_SEQ_LEN, runtime_min_s)
+def _configured_litetopk_fused_min_seq_len(use_fp4: bool = False) -> int:
+    """Return the fixed HOT12288 single-scan crossover."""
+    return _FP4_FUSED_MIN_SEQ_LEN if use_fp4 else _FUSED_MIN_SEQ_LEN
 
 
 def _should_plan_fused_indexer(
@@ -106,11 +97,11 @@ def _should_plan_fused_indexer(
     fused_min_seq_len: int,
 ) -> bool:
     """Whether this whole chunk may skip dense-logits budget splitting."""
+    if fused_min_seq_len <= 0 or num_reqs != 1:
+        return False
     return (
-        fused_min_seq_len > 0
-        and num_reqs == 1
-        and total_seq_len >= fused_min_seq_len
-        and query_len in (_FUSED_QUERY_LEN, _FUSED_TAIL_QUERY_LEN)
+        query_len in (_FUSED_QUERY_LEN, _FUSED_TAIL_QUERY_LEN)
+        and fused_min_seq_len <= total_seq_len <= _FUSED_MAX_SEQ_LEN
     )
 
 
@@ -249,6 +240,10 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     # True only when split_indexer_prefill_chunks deliberately exempted this
     # whole chunk from the dense-logits memory budget.
     fused_indexer_planned: bool = False
+    # Exact min(cu_seqlen_ke) for single-request chunks, in compressed
+    # coordinates: (raw_seq_len - total_query_len + qs_start + 1) // ratio.
+    # Matches the metadata kernel's ke formula; 0 when not applicable.
+    common_ke_min: int = 0
 
 
 @dataclass
@@ -690,7 +685,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # path and must keep the budget, so the exemption is keyed on the
             # same threshold as the runtime gate.
             fused_min_seq_len = (
-                _configured_litetopk_fused_min_seq_len()
+                _configured_litetopk_fused_min_seq_len(self.use_fp4_indexer_cache)
                 if (
                     envs.VLLM_LITETOPK
                     and envs.VLLM_DSA_MODE in ("litetopk", "litedsa")
@@ -699,25 +694,24 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     # that seeds its certified hot carry. Keep budgeted dense
                     # chunks until a checked cold-start bootstrap exists.
                     and not self.vllm_config.cache_config.enable_prefix_caching
-                    and getattr(
-                        self.vllm_config.model_config.hf_config,
-                        "index_n_heads",
-                        None,
+                    and (
+                        getattr(
+                            self.vllm_config.model_config.hf_config,
+                            "index_n_heads",
+                            None,
+                        ),
+                        getattr(
+                            self.vllm_config.model_config.hf_config,
+                            "index_head_dim",
+                            None,
+                        ),
+                        getattr(
+                            self.vllm_config.model_config.hf_config,
+                            "index_topk",
+                            None,
+                        ),
                     )
-                    == 32
-                    and getattr(
-                        self.vllm_config.model_config.hf_config,
-                        "index_head_dim",
-                        None,
-                    )
-                    == 128
-                    and getattr(
-                        self.vllm_config.model_config.hf_config,
-                        "index_topk",
-                        None,
-                    )
-                    == 2048
-                    and not self.use_fp4_indexer_cache
+                    in ((32, 128, 2048), (64, 128, 512))
                     and self.dcp_world_size == 1
                     and not current_platform.is_xpu()
                     and current_platform.is_device_capability_family(100)
@@ -745,6 +739,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     query_start_loc,
                     query_start_loc_cpu,
                     seq_lens,
+                    seq_lens_cpu,
                     compressed_seq_lens,
                     compressed_seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
@@ -884,6 +879,7 @@ def build_prefill_chunk_metadata(
     query_start_loc: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
     uncompressed_seq_lens: torch.Tensor,
+    uncompressed_seq_lens_cpu: torch.Tensor,
     compressed_seq_lens: torch.Tensor,
     compressed_seq_lens_cpu: torch.Tensor,
     block_table: torch.Tensor,
@@ -942,6 +938,11 @@ def build_prefill_chunk_metadata(
         qs_stop = total_query_len
     output_query_len = qs_stop - qs_start
 
+    common_ke_min = 0
+    if num_reqs == 1:
+        raw_seq_len = int(uncompressed_seq_lens_cpu[start_idx].item())
+        common_ke_min = (raw_seq_len - total_query_len + qs_start + 1) // compress_ratio
+
     cu_seq_len_ks = torch.empty(output_query_len, dtype=torch.int32, device=device)
     cu_seq_len_ke = torch.empty(output_query_len, dtype=torch.int32, device=device)
 
@@ -992,6 +993,7 @@ def build_prefill_chunk_metadata(
             output_query_len,
             fused_min_seq_len,
         ),
+        common_ke_min=common_ke_min,
     )
 
 

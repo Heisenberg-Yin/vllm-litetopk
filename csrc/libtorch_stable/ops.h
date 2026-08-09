@@ -332,11 +332,8 @@ void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
                           torch::stable::Tensor& indices, int64_t numRows,
                           int64_t stride0, int64_t stride1, int64_t topK);
 
-// Grouped (packed) sparse prefill attention for DSA models (SM100): union +
-// query-major membership builder (overwrite-write, fused logical->physical
-// conversion) and the fp8 masked head128 attention forward. The Python
-// helper in vllm/model_executor/layers/litedsa.py orchestrates,
-// allocates and version-caches.
+// Grouped sparse prefill attention for DSA models (SM100): an overwrite-write
+// group-union/membership builder and exact FP8 packed attention forward.
 void litedsa_union_qm(const torch::stable::Tensor& topk_indices,
                       torch::stable::Tensor& u_phys,
                       torch::stable::Tensor& counts,

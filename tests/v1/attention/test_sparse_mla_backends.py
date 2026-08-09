@@ -45,11 +45,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.backends.mla.indexer import (
-    _configured_litetopk_fused_min_seq_len,
-    _should_plan_fused_indexer,
-    split_indexer_prefill_chunks,
-)
+from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
     split_prefill_chunks,
@@ -1195,78 +1191,6 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     # req1: M=5, N=50 -> 250 elems fits budget
     expected.append((slice(1, 2), slice(0, 5)))
     assert out == expected
-
-
-def test_split_indexer_prefill_chunks_fused_query_floor():
-    """Production full chunks and the certified 1M tail bypass the budget."""
-    seq_lens = torch.tensor([1048512])
-    max_logits_bytes = 2048 * 1024 * 1024
-
-    fused = split_indexer_prefill_chunks(
-        seq_lens,
-        torch.tensor([8192]),
-        1048512,
-        max_logits_bytes,
-        fused_min_seq_len=262144,
-    )
-    assert fused == [(slice(0, 1), slice(0, 8192))]
-
-    tail = split_indexer_prefill_chunks(
-        seq_lens,
-        torch.tensor([8128]),
-        1048512,
-        max_logits_bytes,
-        fused_min_seq_len=262144,
-    )
-    assert tail == [(slice(0, 1), slice(0, 8128))]
-
-    uncertified_tail = split_indexer_prefill_chunks(
-        seq_lens,
-        torch.tensor([8127]),
-        1048512,
-        max_logits_bytes,
-        fused_min_seq_len=262144,
-    )
-    expected = [
-        (slice(0, 1), slice(offset, min(offset + 512, 8127)))
-        for offset in range(0, 8127, 512)
-    ]
-    assert uncertified_tail == expected
-
-
-def test_should_plan_fused_indexer_requires_one_full_query_chunk():
-    assert _should_plan_fused_indexer(1, 262144, 8192, 262144)
-    assert _should_plan_fused_indexer(1, 262144, 8128, 262144)
-    assert not _should_plan_fused_indexer(1, 262143, 8192, 262144)
-    assert not _should_plan_fused_indexer(1, 262144, 8127, 262144)
-    assert not _should_plan_fused_indexer(1, 1048512, 16384, 262144)
-    assert not _should_plan_fused_indexer(2, 262144, 8192, 262144)
-    assert not _should_plan_fused_indexer(1, 1048512, 8192, 0)
-
-
-def test_configured_litetopk_fused_min_seq_len(monkeypatch):
-    monkeypatch.delenv("VLLM_LITETOPK_HOTONLY", raising=False)
-    monkeypatch.delenv("VLLM_LITETOPK_HOTSAMPLE", raising=False)
-    monkeypatch.delenv("VLLM_LITETOPK_MERGE_CAP", raising=False)
-    monkeypatch.delenv("VLLM_LITETOPK_MIN_S", raising=False)
-    assert _configured_litetopk_fused_min_seq_len() == 196608
-
-    monkeypatch.setenv("VLLM_LITETOPK_MIN_S", "524288")
-    assert _configured_litetopk_fused_min_seq_len() == 524288
-
-    monkeypatch.setenv("VLLM_LITETOPK_MIN_S", "131072")
-    assert _configured_litetopk_fused_min_seq_len() == 196608
-
-    monkeypatch.setenv("VLLM_LITETOPK_HOTONLY", "0")
-    assert _configured_litetopk_fused_min_seq_len() == 0
-
-    monkeypatch.setenv("VLLM_LITETOPK_HOTONLY", "1")
-    monkeypatch.setenv("VLLM_LITETOPK_HOTSAMPLE", "8191")
-    assert _configured_litetopk_fused_min_seq_len() == 0
-
-    monkeypatch.setenv("VLLM_LITETOPK_HOTSAMPLE", "8192")
-    monkeypatch.setenv("VLLM_LITETOPK_MERGE_CAP", "24575")
-    assert _configured_litetopk_fused_min_seq_len() == 0
 
 
 def test_triton_convert_returns_valid_counts():

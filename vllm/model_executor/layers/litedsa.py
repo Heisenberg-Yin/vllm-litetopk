@@ -37,10 +37,29 @@ from collections import OrderedDict
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 _MAX_SEQ_SPACE = 1 << 20
 _DYNAMIC_SEQ_SPACE = os.environ.get("VLLM_LITEDSA_DYNAMIC_SPAN", "1") == "1"
 _UNION_SO = os.environ.get("VLLM_LITEDSA_UNION_SO")
 _UNION_MOD = None
+# VLLM_LITEDSA_SO: load BOTH litedsa ops (union + masked attention) from a
+# TVM-FFI module instead of torch.ops._C — lets a freshly built kernel ship
+# without rebuilding the whole vLLM extension.
+_LITEDSA_SO = os.environ.get("VLLM_LITEDSA_SO")
+_LITEDSA_MOD = None
+_EXECUTION_LOGGED = False
+
+
+def _litedsa_mod():
+    global _LITEDSA_MOD
+    if _LITEDSA_MOD is None:
+        import tvm_ffi
+
+        _LITEDSA_MOD = tvm_ffi.load_module(_LITEDSA_SO)
+    return _LITEDSA_MOD
 
 
 def _union_seq_space(max_seq_len: int) -> int:
@@ -57,7 +76,9 @@ def _union_seq_space(max_seq_len: int) -> int:
 def _run_union(*args) -> None:
     """Run the native union op, or an explicit TVM-FFI A/B override."""
     global _UNION_MOD
-    if _UNION_SO:
+    if _LITEDSA_SO:
+        _litedsa_mod().union_qm(*args)
+    elif _UNION_SO:
         if _UNION_MOD is None:
             import tvm_ffi
 
@@ -69,11 +90,24 @@ def _run_union(*args) -> None:
 
 @functools.cache
 def litedsa_available() -> bool:
-    """True iff the SM100 grouped-attention kernels were compiled."""
+    """True iff native or explicitly loaded SM100 kernels are available."""
     if not torch.cuda.is_available():
         return False
     if torch.cuda.get_device_capability()[0] != 10:
         return False
+    if _LITEDSA_SO:
+        try:
+            mod = _litedsa_mod()
+            _ = mod.union_qm, mod.masked_mla_fp8
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LiteDSA override %s is unavailable (%s); falling back to "
+                "the stock sparse-attention path",
+                _LITEDSA_SO,
+                exc,
+            )
+            return False
     return hasattr(torch.ops._C, "litedsa_union_qm") and hasattr(
         torch.ops._C, "litedsa_masked_mla_fp8"
     )
@@ -273,7 +307,9 @@ def litedsa_masked_mqa(
         version,
         seq_space,
     )
-    qp = q.view(ng, 128, q.shape[2]).contiguous()
+    # ``view`` itself requires compatible strides, so make the input
+    # contiguous before reshaping (rather than after it).
+    qp = q.contiguous().view(ng, 128, q.shape[2])
     if reuse_output_buffers:
         stream = torch.cuda.current_stream(q.device)
         out, max_logits, lse = _get_or_create_output_buffers(
@@ -286,7 +322,12 @@ def litedsa_masked_mqa(
         out = torch.empty(ng, 128, 512, dtype=torch.bfloat16, device=q.device)
         max_logits = torch.empty(ng, 128, dtype=torch.float32, device=q.device)
         lse = torch.empty(ng, 128, dtype=torch.float32, device=q.device)
-    torch.ops._C.litedsa_masked_mla_fp8(
+    attention_op = (
+        _litedsa_mod().masked_mla_fp8
+        if _LITEDSA_SO
+        else torch.ops._C.litedsa_masked_mla_fp8
+    )
+    attention_op(
         qp,
         kv_cache.view(-1, 1, kv_cache.shape[-1]),
         u_phys.view(ng, 1, -1),
@@ -299,4 +340,8 @@ def litedsa_masked_mqa(
         max_logits,
         lse,
     )
+    global _EXECUTION_LOGGED
+    if not _EXECUTION_LOGGED:
+        logger.info("LITEDSA_KERNEL_EXECUTED grouped masked MLA kernel dispatched")
+        _EXECUTION_LOGGED = True
     return out.view(num_tokens, num_heads, 512)

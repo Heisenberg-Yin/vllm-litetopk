@@ -404,6 +404,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             envs.VLLM_DSA_MODE == "litedsa"
             and pack_g > 1
             and self.dcp_world_size == 1
+            # A group is converted through the block table of its first
+            # token. Restrict the packed path to one request so a group can
+            # never cross a request boundary without adding a device sync.
+            and attn_metadata.num_reqs == 1
             and num_actual_toks % pack_g == 0
             and self.num_heads * pack_g == 128
             and q.dtype == torch.float8_e4m3fn

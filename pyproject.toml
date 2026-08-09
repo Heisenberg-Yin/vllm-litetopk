@@ -129,8 +129,6 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "tests/entrypoints/speech_to_text/transcription/test_transcription_validation.py",
     "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
-    "csrc/libtorch_stable/attention/dsa/vendor_fmla/*",
-    "csrc/libtorch_stable/attention/dsa/vendor_deep_gemm/*",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*",
     "rust/src/parser/src/tool/gemma4.rs", "rust/src/parser/src/unified/gemma4.rs",
     "rust/src/text/src/output/decoded.rs",

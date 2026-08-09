@@ -15,9 +15,8 @@
 // persistent buffers, group packing) lives in
 // vllm/model_executor/layers/litedsa.py.
 //
-// NOTE: compile-unverified inside vLLM's full build as of this draft (the
-// kernel TUs compile standalone with nvcc 12.8 + cutlass 4.x); validate
-// with `uv pip install -e . --torch-backend=auto` on an SM100 host.
+// The vLLM CMake target compiles this TU for SM100a with CUDA 12.8; keep the
+// standalone TVM-FFI override available for rapid kernel A/B iteration.
 
 #include <cuda_runtime.h>
 #include <optional>

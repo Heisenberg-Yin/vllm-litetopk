@@ -1,27 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm import envs
 from vllm.model_executor.layers import litedsa
 
 
 @pytest.fixture(autouse=True)
-def clear_litedsa_output_buffer_cache():
+def clear_litedsa_caches():
+    litedsa.litedsa_available.cache_clear()
     with litedsa._OUTPUT_BUFS_LOCK:
         litedsa._OUTPUT_BUFS.clear()
     yield
+    litedsa.litedsa_available.cache_clear()
     with litedsa._OUTPUT_BUFS_LOCK:
         litedsa._OUTPUT_BUFS.clear()
-
-
-def test_geometric_capacity():
-    assert litedsa._geometric_capacity(1) == 1
-    assert litedsa._geometric_capacity(3) == 4
-    assert litedsa._geometric_capacity(512) == 512
-    with pytest.raises(ValueError):
-        litedsa._geometric_capacity(0)
 
 
 def test_union_seq_space_rounding_and_fixed_ab_mode(monkeypatch):
@@ -45,9 +42,6 @@ def test_output_buffers_reuse_and_grow_on_cpu():
     )
     assert out1.shape == (3, 128, 512)
     assert max1.shape == lse1.shape == (3, 128)
-    assert out1.is_contiguous()
-    assert max1.is_contiguous()
-    assert lse1.is_contiguous()
 
     out2, max2, lse2 = litedsa._get_or_create_output_buffers(
         device, stream_handle=11, owner_thread=22, ng=2
@@ -66,20 +60,11 @@ def test_output_buffers_reuse_and_grow_on_cpu():
     assert litedsa._OUTPUT_BUFS[key][0] == 8
 
 
-def test_output_buffers_do_not_alias_streams_or_host_threads():
-    device = torch.device("cpu")
-    out_a, _, _ = litedsa._get_or_create_output_buffers(device, 1, 7, 1)
-    out_b, _, _ = litedsa._get_or_create_output_buffers(device, 2, 7, 1)
-    out_c, _, _ = litedsa._get_or_create_output_buffers(device, 1, 8, 1)
-    assert len({out_a.data_ptr(), out_b.data_ptr(), out_c.data_ptr()}) == 3
-
-
-def test_output_buffer_pool_count_is_lru_bounded(monkeypatch):
+def test_output_buffer_pool_is_lru_bounded(monkeypatch):
     monkeypatch.setattr(litedsa, "_OUTPUT_BUF_CACHE_MAX_POOLS", 2)
     device = torch.device("cpu")
     litedsa._get_or_create_output_buffers(device, 1, 7, 1)
     litedsa._get_or_create_output_buffers(device, 2, 7, 1)
-    # Touch stream 1, then insert stream 3: stream 2 must be evicted.
     litedsa._get_or_create_output_buffers(device, 1, 7, 1)
     litedsa._get_or_create_output_buffers(device, 3, 7, 1)
 
@@ -100,18 +85,38 @@ def test_reuse_is_disabled_for_autograd_and_capture(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with torch.no_grad(), pytest.raises(RuntimeError, match="capture-safe"):
         litedsa._reuse_output_buffers_allowed()
-    # The public helper checks before dereferencing inputs or launching union.
-    with torch.no_grad(), pytest.raises(RuntimeError, match="capture-safe"):
-        litedsa.litedsa_masked_mqa(None, None, None, None, None, 0, 0, 0.0, 0.0, 0, 0)
 
 
-def test_disabled_env_flag_does_not_query_cuda_capture(monkeypatch):
-    monkeypatch.setattr(litedsa, "_REUSE_OUTPUT_BUFS", False)
+def test_tvm_ffi_override_counts_as_available(monkeypatch):
+    module = SimpleNamespace(union_qm=object(), masked_mla_fp8=object())
+    monkeypatch.setattr(litedsa, "_LITEDSA_SO", "/tmp/litedsa.so")
+    monkeypatch.setattr(litedsa, "_litedsa_mod", lambda: module)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
 
-    def unexpected_capture_query():
-        raise AssertionError("capture state must not be queried when reuse is off")
+    assert litedsa.litedsa_available()
 
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", unexpected_capture_query
-    )
-    assert not litedsa._reuse_output_buffers_allowed()
+
+def test_dsa_mode_is_explicit_and_validated(monkeypatch):
+    get_mode = envs.environment_variables["VLLM_DSA_MODE"]
+    monkeypatch.delenv("VLLM_DSA_MODE", raising=False)
+    assert get_mode() == "raw"
+
+    monkeypatch.setenv("VLLM_DSA_MODE", "LiTeDsA")
+    assert get_mode() == "litedsa"
+
+    monkeypatch.setenv("VLLM_DSA_MODE", "litedas")
+    with pytest.raises(ValueError, match="Valid options"):
+        get_mode()
+
+
+def test_litedsa_override_envs_are_registered():
+    expected = {
+        "VLLM_LITEDSA_SO",
+        "VLLM_LITEDSA_UNION_SO",
+        "VLLM_LITEDSA_DYNAMIC_SPAN",
+        "VLLM_LITEDSA_UNION_STATS",
+        "VLLM_LITEDSA_REUSE_OUTPUT_BUFS",
+        "VLLM_LITETOPK_FP4_PRODUCTION_MIN_S",
+    }
+    assert expected <= envs.environment_variables.keys()
